@@ -90,7 +90,7 @@ def load_document(file_path):
             }
         )
     else:
-        raise ValueError(f"Unsupported file extension {extension}")
+        print(f"Skipping Unsupported file {file_path} {extension}")
     return documents
 
 def chunk_text(text,chunk_size=1000,overlap=200):
@@ -102,6 +102,29 @@ def chunk_text(text,chunk_size=1000,overlap=200):
         start += chunk_size - overlap
     return chunks
 
+def create_embedding(text):
+    response = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents = text
+    )
+    return response.embeddings[0].values
+
+def store_embeddings(new_chunks):
+    for chunk in new_chunks:
+        embedding = create_embedding(chunk["content"])
+        collection.add(
+            ids = [f"{chunk['source']}_{chunk['chunk_id']}"],
+            documents = [chunk["content"]],
+            embeddings = [embedding],
+            metadatas=[
+                {
+                    "source" : chunk["source"],
+                    "chunk_id" :chunk["chunk_id"],
+                    "type": chunk["type"]
+                }
+            ]
+        )
+    print("stored successfully")
 def load_new_folder(folder_path,collection):
     processed_files= get_processed_files(collection)
     all_chunks = []
@@ -128,31 +151,9 @@ def load_new_folder(folder_path,collection):
                     }
                 )
         print(f"Loaded{file}")
-    return all_chunks
+    store_embeddings(all_chunks)
 
-def create_embedding(text):
-    response = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents = text
-    )
-    return response.embeddings[0].values
-
-def store_embeddings(new_chunks):
-    for chunk in new_chunks:
-        embedding = create_embedding(chunk["content"])
-        collection.add(
-            ids = [f"{chunk['source']}_{chunk['chunk_id']}"],
-            documents = [chunk["content"]],
-            embeddings = [embedding],
-            metadatas=[
-                {
-                    "source" : chunk["source"],
-                    "chunk_id" :chunk["chunk_id"],
-                    "type": chunk["type"]
-                }
-            ]
-        )
-    print("stored successfully")
+# load_new_folder("../Data",collection)
 
 def retrieve_chunks(query):
     query_embedding = create_embedding(query)
@@ -160,17 +161,80 @@ def retrieve_chunks(query):
         query_embeddings =[query_embedding],
         n_results = 3
     )
-    return{
-        "documents":results["documents"][0],
-        "metadata": results["metadatas"][0]
-    }
+    return results
 
 def build_context(results):
     context = ""
-    for doc in results["documents"]:
+    for doc in results["documents"][0]:
         context += doc
         context += "\n\n"
     return context
+
+def classify_query(query):
+    query = query.lower()
+    academic_keywords = [
+        "assignment",
+        "mcq",
+        "summary",
+        "notes",
+        "exam",
+        "question",
+        "important question",
+        "interview",
+        "placement",
+        "career",
+        "roadmap",
+        "project",
+        "python",
+        "java",
+        "sql",
+        "javascript",
+        "machine learning",
+        "deep learning",
+        "ai",
+        "artificial intelligence",
+        "rag",
+        "llm",
+        "agent",
+        "dsa",
+        "data structure",
+        "algorithm",
+        "resume",
+        "operating system",
+        "dbms",
+        "computer network",
+        "aptitude",
+        "coding"
+    ]
+    blocked_keywords = [
+        "who is",
+        "stock",
+        "share market",
+        "crypto",
+        "bitcoin",
+        "politics",
+        "election",
+        "prime minister",
+        "president",
+        "movie",
+        "actor",
+        "actress",
+        "celebrity",
+        "ipl",
+        "football",
+        "cricket",
+        "weather",
+        "news"
+    ]
+    for keyword in blocked_keywords:
+        if keyword in query:
+            return "non-academic"
+    # for keyword in academic_keywords:
+    #     if keyword in query:
+    #         return "academic"
+    return "academic"
+
+
 
 def detect_intent(question):
     question = question.lower()
@@ -182,11 +246,60 @@ def detect_intent(question):
         return "important_question"
     elif "solve" in question or "assignment" in question:
         return "assignment"
+    elif "interview" in question or "viva" in question:
+        return "interview_prep"
+    elif "placement" in question or "off-campus" in question:
+        return "placement_prep"
+    elif "roadmap" in question or "career" in question :
+        return "career_guidance"
+    elif "project idea" in question or "project ideas" in question or "project" in question :
+        return "project_idea"
     else:
         return "explanation"
 
-def create_prompt(intent, context, question):
+def create_prompt(intent, context, question,retrieval_found):
+    if retrieval_found:
+        source_instruction = f"""
+        Use the provided study material as the PRIMARY source.
 
+        If the answer exists in the study material,
+        answer using the study material.
+
+        Do not ignore the provided context.
+
+        Study Material:
+        {context}
+        """
+    else:
+        source_instruction = """
+        No relevant study material was found.
+
+        Answer using your academic knowledge.
+
+        You may answer ONLY questions related to:
+
+        - Academic subjects
+        - Assignments
+        - Exams
+        - Interview preparation
+        - Placement preparation
+        - Career guidance
+        - Programming
+        - Artificial Intelligence
+        - Machine Learning
+        - Data Structures & Algorithms
+        - Project ideas
+
+        Do NOT answer:
+
+        - Politics
+        - News
+        - Stock market
+        - Cryptocurrency
+        - Sports
+        - Entertainment
+        - Celebrity topics
+        """
     if intent == "mcq":
 
         return f"""
@@ -203,7 +316,7 @@ def create_prompt(intent, context, question):
             4. Explanation
 
             Context:
-            {context}
+            {source_instruction}
 
             Student Request:
             {question}
@@ -223,7 +336,7 @@ def create_prompt(intent, context, question):
             - Important Points
 
             Context:
-            {context}
+            {source_instruction}
 
             Student Request:
             {question}
@@ -243,12 +356,11 @@ def create_prompt(intent, context, question):
             - 10 Marks Questions
 
             Context:
-            {context}
+            {source_instruction}
 
             Student Request:
             {question}
             """
-
     elif intent == "assignment":
 
         return f"""
@@ -259,12 +371,82 @@ def create_prompt(intent, context, question):
             Use only the provided context.
 
             Context:
-            {context}
+            {source_instruction}
 
             Student Request:
             {question}
             """
+    elif intent == "interview_prep":
 
+        return f"""
+        You are an AI Academic Assistant.
+
+        Help the student prepare for interviews.
+
+        Include:
+
+        - Important concepts to study
+        - Common interview questions
+        - Preparation strategy
+        - Mistakes to avoid
+
+        Student Question:
+        {question}
+        """
+    elif intent == "placement_prep":
+
+        return f"""
+        You are an AI Academic Assistant.
+
+        Help the student prepare for placements.
+
+        Include:
+
+        - Preparation roadmap
+        - Important skills
+        - Aptitude preparation
+        - Technical preparation
+        - Interview preparation tips
+
+        Student Question:
+        {question}
+        """
+    elif intent == "career_guidance":
+
+        return f"""
+        You are an AI Academic Assistant.
+
+        Provide a structured career roadmap.
+
+        Include:
+
+        - Skills to learn
+        - Technologies to focus on
+        - Projects to build
+        - Resources
+        - Career opportunities
+
+        Student Question:
+        {question}
+        """
+    elif intent == "project_idea":
+
+        return f"""
+        You are an AI Academic Assistant.
+
+        Suggest practical project ideas.
+
+        For each project provide:
+
+        - Project Title
+        - Difficulty Level
+        - Tech Stack
+        - Features
+        - Learning Outcomes
+
+        Student Question:
+        {question}
+        """
     else:
 
         return f"""
@@ -273,24 +455,52 @@ def create_prompt(intent, context, question):
             Explain clearly in simple student-friendly language.
 
             Context:
-            {context}
+            {source_instruction}
 
             Student Question:
             {question}
             """
 
+SIMILARITY_THRESHOLD = 1.2
+def validate_retrieval(results):
+    if not results:
+        return False
+    documents = results.get("documents", [])
+    distances = results.get("distances", [])
+    if not documents or not documents[0]:
+        return False
+    if not distances or not distances[0]:
+        return False
+    best_distance = distances[0][0]
+    return best_distance <= SIMILARITY_THRESHOLD
+
 def ask_question(query):
-    
+    query_type = classify_query(query)
+    if query_type =="non-academic":
+        return {
+        "answer":
+        """
+        This assistant is designed only for
+        academic learning, placement preparation,
+        interview preparation and career guidance.
+
+        Please ask an academic-related question.
+        """,
+        "sources":[]
+        }
     results = retrieve_chunks(query)
-    context = build_context(results)
-    metadata = results["metadata"]
+    retrieval_found = validate_retrieval(results)
+    if retrieval_found:
+        context = build_context(results)
+        metadata = results["metadatas"][0]
+    else:
+        context = ""
+        metadata = []
     intent = detect_intent(query)
     # Step 5: Create prompt
     prompt = create_prompt(
-        intent,context,query
+        intent,context,query,retrieval_found
     ) 
-     
-
     # Step 6: Generate answer
     response = client.models.generate_content(
         model="gemini-2.5-flash",
